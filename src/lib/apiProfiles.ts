@@ -3,6 +3,7 @@ import type {
   ApiProfile,
   ApiProvider,
   AppSettings,
+  AgentApiConfigMode,
   CustomProviderContentType,
   CustomProviderDefinition,
   CustomProviderFileMapping,
@@ -11,10 +12,10 @@ import type {
   CustomProviderResultMapping,
   CustomProviderSubmitMapping,
   CustomProviderTemplate,
-  ReferenceImageEditAction,
 } from '../types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, DEFAULT_ZIP_DOWNLOAD_ROUTES, ZIP_DOWNLOAD_ROUTE_VALUES } from '../types'
 import { shouldUseApiProxy } from './devProxy'
+import { normalizeReasoningEffort, normalizeStreamPartialImages, parseDefaultApiUrl } from './defaultApiUrl'
 import { readRuntimeEnv } from './runtimeEnv'
 import { isImportableConfigUrl } from './customProviderConfigUrl'
 
@@ -23,11 +24,12 @@ const RAW_DEFAULT_API_URL = readRuntimeEnv(import.meta.env.VITE_DEFAULT_API_URL)
 const DEFAULT_OPENAI_API_PROXY = readRuntimeEnv(import.meta.env.VITE_API_PROXY_AVAILABLE) === 'true'
 const DOCKER_DEPLOYMENT = readRuntimeEnv(import.meta.env.VITE_DOCKER_DEPLOYMENT) === 'true'
 const SHOW_DEFAULT_CONFIG_ONLY = readRuntimeEnv(import.meta.env.VITE_SHOW_DEFAULT_CONFIG_ONLY) === 'true'
-const DEFAULT_BASE_URL = isImportableConfigUrl(RAW_DEFAULT_API_URL)
-  ? ''
-  : RAW_DEFAULT_API_URL || (DOCKER_DEPLOYMENT && DEFAULT_OPENAI_API_PROXY ? '' : OPENAI_DEFAULT_BASE_URL)
+const DEFAULT_API_URL_PATCH = isImportableConfigUrl(RAW_DEFAULT_API_URL)
+  ? null
+  : parseDefaultApiUrl(RAW_DEFAULT_API_URL || (DOCKER_DEPLOYMENT && DEFAULT_OPENAI_API_PROXY ? '' : OPENAI_DEFAULT_BASE_URL))
+const DEFAULT_BASE_URL = DEFAULT_API_URL_PATCH?.baseUrl ?? ''
 export const DEFAULT_IMAGES_MODEL = 'gpt-image-2'
-export const DEFAULT_RESPONSES_MODEL = 'gpt-5.5'
+export const DEFAULT_RESPONSES_MODEL = 'gpt-5.6-sol'
 export const DEFAULT_FAL_BASE_URL = 'https://fal.run'
 export const DEFAULT_FAL_MODEL = 'openai/gpt-image-2'
 export const DEFAULT_OPENAI_PROFILE_ID = 'default-openai'
@@ -65,12 +67,7 @@ function getDefaultStreamImages(provider: ApiProvider, apiMode: ApiMode): boolea
   return provider === 'openai' && apiMode === 'responses'
 }
 
-export function normalizeStreamPartialImages(value: unknown, fallback: number | undefined = DEFAULT_STREAM_PARTIAL_IMAGES): number {
-  const fallbackValue = fallback ?? DEFAULT_STREAM_PARTIAL_IMAGES
-  const numeric = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(numeric)) return fallbackValue
-  return Math.min(3, Math.max(0, Math.trunc(numeric)))
-}
+export { normalizeReasoningEffort, normalizeStreamPartialImages } from './defaultApiUrl'
 
 export function normalizeAgentMaxToolRounds(value: unknown, fallback: number | undefined = DEFAULT_AGENT_MAX_TOOL_ROUNDS): number {
   const fallbackValue = fallback ?? DEFAULT_AGENT_MAX_TOOL_ROUNDS
@@ -83,14 +80,30 @@ export function isDefaultConfigOnlyEnabled(): boolean {
   return SHOW_DEFAULT_CONFIG_ONLY && (Boolean(RAW_DEFAULT_API_URL) || DEFAULT_OPENAI_API_PROXY)
 }
 
-function normalizeReferenceImageEditAction(value: unknown): ReferenceImageEditAction {
-  return value === 'replace-reference' || value === 'add-mask' ? value : 'ask'
-}
-
 function normalizeZipDownloadRoutes(value: unknown) {
   if (!Array.isArray(value)) return [...DEFAULT_ZIP_DOWNLOAD_ROUTES]
   const allowed = new Set<string>(ZIP_DOWNLOAD_ROUTE_VALUES)
   return value.filter((item): item is typeof ZIP_DOWNLOAD_ROUTE_VALUES[number] => typeof item === 'string' && allowed.has(item))
+}
+
+function normalizeProviderOrder(value: unknown, customProviders: CustomProviderDefinition[]): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+
+  const providerIds = ['openai', 'fal', ...customProviders.map((provider) => provider.id)]
+  const knownIds = new Set(providerIds)
+  const ordered = value
+    .map(String)
+    .filter((id, idx, list) => knownIds.has(id) && list.indexOf(id) === idx)
+
+  return [...ordered, ...providerIds.filter((id) => !ordered.includes(id))]
+}
+
+function normalizeAgentApiConfigMode(value: unknown): AgentApiConfigMode {
+  return value === 'native' || value === 'hybrid' ? value : 'off'
+}
+
+export function isAgentTextApiProfile(profile: ApiProfile): boolean {
+  return profile.provider === 'openai' && profile.apiMode === 'responses'
 }
 
 function isCustomProviderTemplate(value: unknown): value is CustomProviderTemplate {
@@ -298,20 +311,21 @@ export function normalizeCustomProviderDefinitions(input: unknown): CustomProvid
 }
 
 export function createDefaultOpenAIProfile(overrides: Partial<ApiProfile> = {}): ApiProfile {
-  const apiMode = overrides.apiMode ?? 'images'
-  const streamImages = overrides.streamImages ?? getDefaultStreamImages('openai', apiMode)
+  const apiMode = overrides.apiMode ?? DEFAULT_API_URL_PATCH?.apiMode ?? 'images'
+  const streamImages = overrides.streamImages ?? DEFAULT_API_URL_PATCH?.streamImages ?? getDefaultStreamImages('openai', apiMode)
 
   return {
     id: DEFAULT_OPENAI_PROFILE_ID,
-    name: '默认',
+    name: DEFAULT_API_URL_PATCH?.name ?? '默认',
     provider: 'openai',
     baseUrl: DEFAULT_BASE_URL,
-    apiKey: '',
-    model: DEFAULT_IMAGES_MODEL,
+    apiKey: DEFAULT_API_URL_PATCH?.apiKey ?? '',
+    model: DEFAULT_API_URL_PATCH?.model ?? DEFAULT_IMAGES_MODEL,
     timeout: DEFAULT_API_TIMEOUT,
-    codexCli: false,
+    reasoningEffort: DEFAULT_API_URL_PATCH?.reasoningEffort,
+    codexCli: DEFAULT_API_URL_PATCH?.codexCli ?? false,
     apiProxy: DEFAULT_OPENAI_API_PROXY,
-    streamPartialImages: DEFAULT_STREAM_PARTIAL_IMAGES,
+    streamPartialImages: DEFAULT_API_URL_PATCH?.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES,
     ...overrides,
     apiMode,
     streamImages,
@@ -343,6 +357,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       baseUrl: profile.baseUrl,
       model: profile.model,
       apiMode: profile.apiMode,
+      reasoningEffort: profile.reasoningEffort,
       codexCli: profile.codexCli,
       apiProxy: profile.apiProxy,
       responseFormatB64Json: profile.responseFormatB64Json,
@@ -359,6 +374,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       baseUrl: savedDraft?.baseUrl ?? DEFAULT_FAL_BASE_URL,
       model: savedDraft?.model ?? DEFAULT_FAL_MODEL,
       apiMode: 'images',
+      reasoningEffort: savedDraft?.reasoningEffort,
       codexCli: false,
       apiProxy: false,
       responseFormatB64Json: savedDraft?.responseFormatB64Json,
@@ -376,6 +392,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       baseUrl: savedDraft?.baseUrl ?? (shouldUseOpenAIDefaults ? DEFAULT_BASE_URL : profile.baseUrl || DEFAULT_BASE_URL),
       model: savedDraft?.model ?? (shouldUseOpenAIDefaults ? DEFAULT_IMAGES_MODEL : profile.model || DEFAULT_IMAGES_MODEL),
       apiMode: 'images',
+      reasoningEffort: savedDraft?.reasoningEffort,
       codexCli: false,
       apiProxy: false,
       responseFormatB64Json: savedDraft?.responseFormatB64Json,
@@ -399,6 +416,7 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
     baseUrl: savedDraft?.baseUrl ?? DEFAULT_BASE_URL,
     model: savedDraft?.model ?? DEFAULT_IMAGES_MODEL,
     apiMode: nextApiMode,
+    reasoningEffort: savedDraft?.reasoningEffort ?? profile.reasoningEffort,
     codexCli: savedDraft?.codexCli ?? profile.codexCli,
     apiProxy: savedDraft?.apiProxy ?? DEFAULT_OPENAI_API_PROXY,
     responseFormatB64Json: savedDraft?.responseFormatB64Json,
@@ -423,6 +441,7 @@ function normalizeProviderDraft(input: unknown, provider: ApiProvider, customPro
       : baseUrl,
     model,
     apiMode,
+    reasoningEffort: normalizeReasoningEffort(input.reasoningEffort),
     codexCli: typeof input.codexCli === 'boolean' ? input.codexCli : fallback.codexCli,
     apiProxy: typeof input.apiProxy === 'boolean' ? input.apiProxy : fallback.apiProxy,
     responseFormatB64Json: input.responseFormatB64Json === true ? true : undefined,
@@ -463,6 +482,7 @@ export function normalizeApiProfile(input: unknown, fallback?: Partial<ApiProfil
     model: typeof record.model === 'string' && record.model.trim() ? record.model : defaults.model,
     timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : defaults.timeout,
     apiMode,
+    reasoningEffort: normalizeReasoningEffort(record.reasoningEffort, defaults.reasoningEffort),
     codexCli: Boolean(record.codexCli),
     apiProxy: typeof record.apiProxy === 'boolean' ? record.apiProxy : defaults.apiProxy,
     responseFormatB64Json: record.responseFormatB64Json === true ? true : undefined,
@@ -509,6 +529,14 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     ? record.activeProfileId
     : profiles[0].id
   const active = profiles.find((p) => p.id === activeProfileId) ?? profiles[0]
+  const agentApiConfigMode = normalizeAgentApiConfigMode(record.agentApiConfigMode)
+  const firstAgentTextProfile = profiles.find(isAgentTextApiProfile)
+  const agentTextProfileId = typeof record.agentTextProfileId === 'string' && profiles.some((p) => p.id === record.agentTextProfileId && isAgentTextApiProfile(p))
+    ? record.agentTextProfileId
+    : (isAgentTextApiProfile(active) ? active.id : firstAgentTextProfile?.id ?? null)
+  const agentImageProfileId = typeof record.agentImageProfileId === 'string' && profiles.some((p) => p.id === record.agentImageProfileId)
+    ? record.agentImageProfileId
+    : active.id
 
   return {
     baseUrl: active.baseUrl,
@@ -521,22 +549,37 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     streamImages: active.streamImages,
     streamPartialImages: active.streamPartialImages,
     customProviders,
-    providerOrder: Array.isArray(record.providerOrder) ? record.providerOrder.map(String) : undefined,
+    providerOrder: normalizeProviderOrder(record.providerOrder, customProviders),
     clearInputAfterSubmit: typeof record.clearInputAfterSubmit === 'boolean' ? record.clearInputAfterSubmit : false,
     persistInputOnRestart: typeof record.persistInputOnRestart === 'boolean' ? record.persistInputOnRestart : true,
     reuseTaskApiProfileTemporarily: typeof record.reuseTaskApiProfileTemporarily === 'boolean' ? record.reuseTaskApiProfileTemporarily : false,
     alwaysShowRetryButton: typeof record.alwaysShowRetryButton === 'boolean' ? record.alwaysShowRetryButton : false,
+    allowPromptRewrite: typeof record.allowPromptRewrite === 'boolean' ? record.allowPromptRewrite : false,
     taskCompletionNotification: typeof record.taskCompletionNotification === 'boolean' ? record.taskCompletionNotification : false,
     enterSubmit: typeof record.enterSubmit === 'boolean' ? record.enterSubmit : false,
-    referenceImageEditAction: normalizeReferenceImageEditAction(record.referenceImageEditAction),
     zipDownloadRoutes: normalizeZipDownloadRoutes(record.zipDownloadRoutes),
     agentScrollToBottomAfterSubmit: typeof record.agentScrollToBottomAfterSubmit === 'boolean' ? record.agentScrollToBottomAfterSubmit : true,
     agentMaxToolRounds: normalizeAgentMaxToolRounds(record.agentMaxToolRounds),
     agentWebSearch: typeof record.agentWebSearch === 'boolean' ? record.agentWebSearch : false,
     agentMathFormattingPrompt: typeof record.agentMathFormattingPrompt === 'boolean' ? record.agentMathFormattingPrompt : true,
+    agentApiConfigMode,
+    agentTextProfileId,
+    agentImageProfileId,
     profiles,
     activeProfileId,
   }
+}
+
+export function getAgentTextApiProfile(settings: Partial<AppSettings> | unknown): ApiProfile | null {
+  const normalized = normalizeSettings(settings)
+  if (normalized.agentApiConfigMode === 'off') return getActiveApiProfile(normalized)
+  return normalized.profiles.find((profile) => profile.id === normalized.agentTextProfileId) ?? null
+}
+
+export function getAgentImageApiProfile(settings: Partial<AppSettings> | unknown): ApiProfile | null {
+  const normalized = normalizeSettings(settings)
+  if (normalized.agentApiConfigMode !== 'hybrid') return getAgentTextApiProfile(normalized)
+  return normalized.profiles.find((profile) => profile.id === normalized.agentImageProfileId) ?? null
 }
 
 export function getCustomProviderDefinition(settings: Partial<AppSettings> | unknown, provider: ApiProvider): CustomProviderDefinition | null {
@@ -653,6 +696,7 @@ function isDefaultOpenAIProfile(profile: ApiProfile): boolean {
     profile.model === DEFAULT_IMAGES_MODEL &&
     profile.timeout === DEFAULT_API_TIMEOUT &&
     profile.apiMode === 'images' &&
+    profile.reasoningEffort === undefined &&
     profile.codexCli === false &&
     profile.apiProxy === DEFAULT_OPENAI_API_PROXY &&
     profile.streamImages === false &&
@@ -682,6 +726,7 @@ function getApiProfileDedupKey(profile: ApiProfile): string {
     profile.apiKey.trim(),
     profile.model.trim(),
     profile.apiMode,
+    profile.reasoningEffort,
   ])
 }
 
@@ -691,6 +736,7 @@ function getApiProfileConnectionKey(profile: ApiProfile): string {
     profile.baseUrl.trim().replace(/\/+$/, '').toLowerCase(),
     profile.model.trim(),
     profile.apiMode,
+    profile.reasoningEffort,
   ])
 }
 
@@ -805,25 +851,28 @@ export function mergeImportedSettings(currentSettings: Partial<AppSettings> | un
 
 export const DEFAULT_SETTINGS: AppSettings = normalizeSettings({
   baseUrl: DEFAULT_BASE_URL,
-  apiKey: '',
-  model: DEFAULT_IMAGES_MODEL,
+  apiKey: DEFAULT_API_URL_PATCH?.apiKey ?? '',
+  model: DEFAULT_API_URL_PATCH?.model ?? DEFAULT_IMAGES_MODEL,
   timeout: DEFAULT_API_TIMEOUT,
-  apiMode: 'images',
-  codexCli: false,
+  apiMode: DEFAULT_API_URL_PATCH?.apiMode ?? 'images',
+  codexCli: DEFAULT_API_URL_PATCH?.codexCli ?? false,
   apiProxy: DEFAULT_OPENAI_API_PROXY,
-  streamImages: false,
-  streamPartialImages: DEFAULT_STREAM_PARTIAL_IMAGES,
+  streamImages: DEFAULT_API_URL_PATCH?.streamImages ?? getDefaultStreamImages('openai', DEFAULT_API_URL_PATCH?.apiMode ?? 'images'),
+  streamPartialImages: DEFAULT_API_URL_PATCH?.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES,
   customProviders: [],
   clearInputAfterSubmit: false,
   persistInputOnRestart: true,
   reuseTaskApiProfileTemporarily: false,
   alwaysShowRetryButton: false,
+  allowPromptRewrite: false,
   taskCompletionNotification: false,
   enterSubmit: false,
-  referenceImageEditAction: 'ask',
   zipDownloadRoutes: DEFAULT_ZIP_DOWNLOAD_ROUTES,
   agentScrollToBottomAfterSubmit: true,
   agentMaxToolRounds: DEFAULT_AGENT_MAX_TOOL_ROUNDS,
   agentWebSearch: false,
   agentMathFormattingPrompt: true,
+  agentApiConfigMode: 'off',
+  agentTextProfileId: null,
+  agentImageProfileId: null,
 })
